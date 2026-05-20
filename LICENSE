@@ -1,10 +1,6 @@
 MIT License
 
-Copyright 2025-2026 Kizuna Intelligence contributors.
-
-This repository vendors `irodori_tts_lite/fused_int4_linear.py` from the
-OneCompression project (copyright 2025-2026 Fujitsu Ltd., MIT-licensed). The
-original copyright is retained in that file's header.
+Copyright (c) 2026 Irodori-API contributors.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

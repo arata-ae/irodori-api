@@ -18,17 +18,15 @@ from pydantic import BaseModel, ConfigDict, Field
 from .audio import CONTENT_TYPES, encode_audio, normalize_response_format
 from .config import get_settings
 from .duration import estimate_seconds, split_text
-from .upstream import ensure_upstream_path, require_upstream
+from .runtime_imports import require_runtime_package
 from .voices import VoiceRegistry
 
 _settings = get_settings()
-if _settings.upstream_path:
-    ensure_upstream_path(_settings.upstream_path)
-require_upstream()
+require_runtime_package()
 
 from irodori_tts.inference_runtime import SamplingRequest  # noqa: E402
 
-from .runtime import RuntimeManager  # noqa: E402
+from .runtime import RuntimeLoadTimeoutError, RuntimeManager  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -152,7 +150,12 @@ async def validation_exception_handler(
 
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
-    return openai_error_response(str(exc), status_code=500, error_type="server_error")
+    logger.error("unhandled api error", exc_info=(type(exc), exc, exc.__traceback__))
+    return openai_error_response(
+        "Internal server error.",
+        status_code=500,
+        error_type="server_error",
+    )
 
 
 @app.get("/health")
@@ -346,16 +349,39 @@ async def create_speech(req: SpeechRequest) -> Response:
         raise HTTPException(status_code=400, detail="Streaming synthesis is not implemented.")
     if req.model not in {None, settings.model_name}:
         raise HTTPException(status_code=400, detail=f"Unknown model: {req.model!r}")
+    if req.speed != 1.0:
+        raise HTTPException(status_code=400, detail="Speed is not supported by this runtime.")
 
-    response_format = normalize_response_format(req.response_format, settings.default_response_format)
-    runtime = runtime_manager.get()
+    text = req.input.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Input must not be blank.")
+
+    try:
+        response_format = normalize_response_format(
+            req.response_format,
+            settings.default_response_format,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
+        runtime = runtime_manager.get()
+    except RuntimeLoadTimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Runtime load timed out.") from exc
+
+    request = req.model_copy(update={"input": text})
     semaphore = await _get_synthesis_semaphore()
     started = time.perf_counter()
     async with semaphore:
-        result = await asyncio.wait_for(
-            asyncio.to_thread(_synthesize_sync, runtime, req),
-            timeout=float(settings.synthesis_wait_timeout),
-        )
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_synthesize_sync, runtime, request),
+                timeout=float(settings.synthesis_wait_timeout),
+            )
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(status_code=504, detail="Synthesis timed out.") from exc
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     audio_bytes = encode_audio(result.audio, result.sample_rate, response_format)
     logger.info(
         "speech synthesis completed: elapsed=%.2fs audio_seconds=%.2f bytes=%s seed=%s",
@@ -365,4 +391,8 @@ async def create_speech(req: SpeechRequest) -> Response:
         getattr(result, "used_seed", None),
     )
     headers = {"X-Irodori-Seed": str(getattr(result, "used_seed", ""))}
-    return Response(content=audio_bytes, media_type=CONTENT_TYPES[response_format], headers=headers)
+    return Response(
+        content=audio_bytes,
+        media_type=CONTENT_TYPES[response_format],
+        headers=headers,
+    )

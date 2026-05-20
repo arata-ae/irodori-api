@@ -7,17 +7,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from irodori_tts_lite.weights import DEFAULT_DIT_FILE, DEFAULT_REPO
 
-DEFAULT_UPSTREAM_PATH = Path(__file__).resolve().parents[2] / "Irodori-TTS"
-
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="IRODORI_", extra="ignore")
 
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8088
     api_key: str | None = None
     cors_origins: list[str] = Field(default_factory=list)
-    upstream_path: Path | None = DEFAULT_UPSTREAM_PATH
 
     checkpoint: str | None = None
     hf_checkpoint: str = DEFAULT_REPO

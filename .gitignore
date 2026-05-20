@@ -1,11 +1,24 @@
+.DS_Store
+
+# python bytecode and caches
 __pycache__/
 *.py[cod]
-*.egg-info/
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# local environments and build artifacts
 .venv/
 build/
 dist/
+*.egg-info/
+
+# local runtime state
+voices/
+weights/
+*.wav
+
+# editor state
 .idea/
 .vscode/
-*.wav
-!example/*.wav
-weights/
