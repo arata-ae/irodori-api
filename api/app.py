@@ -9,6 +9,7 @@ from functools import partial
 from typing import Any, Literal
 
 import torch
+import irodori_tts_lite
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -164,9 +165,8 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "model": {
-            "id": settings.model_name,
-            "hf_checkpoint": settings.hf_checkpoint,
-            "hf_checkpoint_file": settings.hf_checkpoint_file,
+            "id": settings.effective_model_name,
+            "checkpoint_file": settings.checkpoint_file,
             "model_device": settings.model_device,
             "codec_device": settings.codec_device,
             "model_precision": settings.model_precision,
@@ -176,6 +176,8 @@ def health() -> dict[str, Any]:
             "disable_eager_dequant": settings.disable_eager_dequant,
             "codec_int4": settings.codec_int4,
             "codec_int4_groupsize": settings.codec_int4_groupsize,
+            "pack_rtn_extras": settings.pack_rtn_extras,
+            "hf_duration_donor": settings.hf_duration_donor,
             "compile_model": settings.compile_model,
             "compile_dynamic": settings.compile_dynamic,
         },
@@ -183,6 +185,7 @@ def health() -> dict[str, Any]:
             "loaded": runtime_manager.is_loaded,
             "loading": runtime_manager.is_loading,
             "checkpoint": runtime_manager.checkpoint_path,
+            "checkpoints": runtime_manager.checkpoint_paths,
             "load_timeout": settings.model_load_timeout,
             "max_concurrent_synthesis": settings.max_concurrent_synthesis,
             "synthesis_wait_timeout": settings.synthesis_wait_timeout,
@@ -214,7 +217,13 @@ def list_models() -> dict[str, Any]:
         "object": "list",
         "data": [
             {
-                "id": settings.model_name,
+                "id": "irodori-tts-v2",
+                "object": "model",
+                "created": 0,
+                "owned_by": "irodori-api",
+            },
+            {
+                "id": "irodori-tts-v3",
                 "object": "model",
                 "created": 0,
                 "owned_by": "irodori-api",
@@ -314,6 +323,9 @@ def _concat_results(results: list[Any]):
 
 def _synthesize_sync(runtime, req: SpeechRequest):
     manual_seconds = req.irodori.seconds
+    use_model_duration_predictor = bool(
+        getattr(getattr(runtime, "model_cfg", None), "use_duration_predictor", False)
+    )
     chunking_enabled = (
         settings.default_chunking_enabled
         if req.irodori.chunking_enabled is None
@@ -327,7 +339,11 @@ def _synthesize_sync(runtime, req: SpeechRequest):
     results = []
     for text in texts:
         seconds = manual_seconds
-        if seconds is None and settings.default_auto_seconds:
+        if (
+            seconds is None
+            and settings.default_auto_seconds
+            and not use_model_duration_predictor
+        ):
             estimate = estimate_seconds(
                 text,
                 min_seconds=req.irodori.min_seconds or settings.default_auto_min_seconds,
@@ -347,8 +363,15 @@ def _synthesize_sync(runtime, req: SpeechRequest):
 async def create_speech(req: SpeechRequest) -> Response:
     if req.stream_format is not None:
         raise HTTPException(status_code=400, detail="Streaming synthesis is not implemented.")
-    if req.model not in {None, settings.model_name}:
-        raise HTTPException(status_code=400, detail=f"Unknown model: {req.model!r}")
+    requested_model = str(req.model or "").strip()
+    try:
+        checkpoint_file = (
+            irodori_tts_lite.checkpoint_file_from_model_name(requested_model)
+            if requested_model
+            else settings.checkpoint_file
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     if req.speed != 1.0:
         raise HTTPException(status_code=400, detail="Speed is not supported by this runtime.")
 
@@ -365,7 +388,7 @@ async def create_speech(req: SpeechRequest) -> Response:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        runtime = runtime_manager.get()
+        runtime = runtime_manager.get(checkpoint_file)
     except RuntimeLoadTimeoutError as exc:
         raise HTTPException(status_code=504, detail="Runtime load timed out.") from exc
 

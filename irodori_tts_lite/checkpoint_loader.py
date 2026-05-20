@@ -7,8 +7,9 @@ with:
   * DiT-block Linears swapped for `FusedInt4Linear` (Triton kernel)
   * AdaLN projections eager-dequantized to fp16 nn.Linear at load time
     (hot path; per-launch Triton overhead would dominate)
-  * Encoder / cond_module / text_embedding extras dequantized to fp16
-    nn.Linear / nn.Embedding (cold path; called once per inference)
+  * Encoder / cond_module extras kept packed when they are Linear-compatible,
+    with non-Linear extras falling back to eager fp16 dequantization
+  * Embedding tables kept packed and dequantized per input row on forward
 
 Call `patch()` once before `inference_runtime.InferenceRuntime.from_key`
 is used. Re-importing the standard `infer` CLI after patching gives you a
@@ -41,6 +42,8 @@ class _Options:
     disable_eager: bool = False
     codec_int4: bool = False
     codec_int4_groupsize: int = 32
+    pack_rtn_extras: bool = True
+    duration_donor: str | None = None
 
 
 _opts = _Options()
@@ -53,6 +56,8 @@ def configure(
     disable_eager: bool | None = None,
     codec_int4: bool | None = None,
     codec_int4_groupsize: int | None = None,
+    pack_rtn_extras: bool | None = None,
+    duration_donor: str | None = None,
 ) -> None:
     """Adjust runtime knobs before the first `from_key` call."""
     if use_fused is not None:
@@ -65,6 +70,10 @@ def configure(
         _opts.codec_int4 = codec_int4
     if codec_int4_groupsize is not None:
         _opts.codec_int4_groupsize = codec_int4_groupsize
+    if pack_rtn_extras is not None:
+        _opts.pack_rtn_extras = pack_rtn_extras
+    if duration_donor is not None:
+        _opts.duration_donor = duration_donor
 
 
 def _should_eager_dequant(name: str) -> bool:
@@ -86,6 +95,7 @@ def _can_use_fused(in_features: int, out_features: int, wbits: int, groupsize: i
 
 _PENDING_SWAPS: dict[str, dict] = {}
 _PENDING_EXTRA: dict[str, dict] = {}
+_PENDING_EMBED: dict[str, dict] = {}
 
 
 def _call_with_supported_kwargs(fn, **kwargs):
@@ -103,6 +113,7 @@ def _patched_load(path):
     state, cfg, train_cfg = _orig_load(path)
     quant_layers = None
     extra_layers = None
+    embed_layers = None
     try:
         with safe_open(str(path), framework="pt", device="cpu") as f:
             md = f.metadata() or {}
@@ -110,15 +121,20 @@ def _patched_load(path):
                 quant_layers = json.loads(md["quant_layers_json"])
             if "extra_quant_layers_json" in md:
                 extra_layers = json.loads(md["extra_quant_layers_json"])
+            if "embed_quant_layers_json" in md:
+                embed_layers = json.loads(md["embed_quant_layers_json"])
     except Exception:
         quant_layers = None
         extra_layers = None
+        embed_layers = None
 
     if not quant_layers:
         _PENDING_SWAPS.clear()
     if not extra_layers:
         _PENDING_EXTRA.clear()
-    if not quant_layers and not extra_layers:
+    if not embed_layers:
+        _PENDING_EMBED.clear()
+    if not quant_layers and not extra_layers and not embed_layers:
         return state, cfg, train_cfg
 
     if quant_layers:
@@ -153,6 +169,21 @@ def _patched_load(path):
             if bkey in state:
                 tensors["bias"] = state.pop(bkey)
             _PENDING_EXTRA[name] = {"entry": entry, "tensors": tensors}
+
+    if embed_layers:
+        print(
+            f"[irodori_tts_lite] detected {len(embed_layers)} extra-quant "
+            f"embedding tables"
+        )
+        _PENDING_EMBED.clear()
+        for entry in embed_layers:
+            name = entry["name"]
+            tensors = {}
+            for s in ("qweight_u8", "scales", "zeros"):
+                k = f"_embed.{name}.{s}"
+                if k in state:
+                    tensors[s] = state.pop(k)
+            _PENDING_EMBED[name] = {"entry": entry, "tensors": tensors}
 
     return state, cfg, train_cfg
 
@@ -213,11 +244,35 @@ def _patched_from_key(cls, key):
     )
     model_cfg = _DiTModelConfig(**model_cfg_dict)
 
+    donor_duration_state: dict[str, torch.Tensor] = {}
+    if _opts.duration_donor and not getattr(model_cfg, "use_duration_predictor", False):
+        from .weights import resolve_checkpoint
+
+        donor_path = Path(resolve_checkpoint(_opts.duration_donor)).expanduser()
+        with safe_open(str(donor_path), framework="pt", device="cpu") as f:
+            donor_metadata = f.metadata() or {}
+            donor_cfg = json.loads(donor_metadata.get("config_json", "{}"))
+            for key_name, value in donor_cfg.items():
+                if key_name.startswith("duration_") and hasattr(model_cfg, key_name):
+                    setattr(model_cfg, key_name, value)
+            model_cfg.use_duration_predictor = True
+            for tensor_name in f.keys():
+                if tensor_name.startswith("duration_predictor."):
+                    donor_duration_state[tensor_name] = f.get_tensor(tensor_name)
+        print(
+            f"[irodori_tts_lite] grafting duration predictor from donor "
+            f"{donor_path} ({len(donor_duration_state)} tensors)"
+        )
+
     # Build fp32 model on CPU first — at wide-scope quant the freshly-instantiated
     # fp32 model is ~2GB; swap quantized layers on CPU then move the assembled
     # (much smaller) model to GPU at the end.
     model = TextToLatentRFDiT(model_cfg)
-    target_device = torch.device("cpu") if (_PENDING_SWAPS or _PENDING_EXTRA) else model_device
+    target_device = (
+        torch.device("cpu")
+        if (_PENDING_SWAPS or _PENDING_EXTRA or _PENDING_EMBED)
+        else model_device
+    )
     model = model.to(target_device)
 
     eager_dtype = torch.float16 if _opts.force_fp16 else model_dtype
@@ -253,45 +308,109 @@ def _patched_from_key(cls, key):
         )
 
     if _PENDING_EXTRA:
+        from .packed_linear import PackedRTNLinear
         modules_now = dict(model.named_modules())
         extra_count = 0
+        packed_count = 0
         for name, info in _PENDING_EXTRA.items():
             entry = info["entry"]
             tensors = info["tensors"]
             in_f = int(entry["in_features"])
             out_f = int(entry["out_features"])
-            weight = dequant_extra_u8_to_weight(
-                tensors["qweight_u8"], tensors["scales"], tensors["zeros"],
-                in_f, out_f, eager_dtype,
-            ).to(target_device)
             target_mod = modules_now.get(name)
             if target_mod is None:
                 raise KeyError(f"extra-quant target not found in model: {name}")
             target_w = target_mod.weight
-            with torch.no_grad():
-                # Some "extras" are non-Linear (RMSNorm q_norm/k_norm stored
-                # with shape (heads, head_dim) but packed as if (in=head_dim,
-                # out=heads)). Reshape into the target module's parameter shape
-                # in those cases so we don't corrupt the module class.
-                if target_w.shape == weight.shape:
-                    target_mod.weight = torch.nn.Parameter(weight, requires_grad=False)
-                elif target_w.numel() == weight.numel():
-                    target_mod.weight = torch.nn.Parameter(
-                        weight.reshape(target_w.shape).contiguous(), requires_grad=False,
-                    )
-                else:
-                    raise RuntimeError(
-                        f"extra-quant shape mismatch at {name}: target {tuple(target_w.shape)} "
-                        f"vs decoded {tuple(weight.shape)}"
-                    )
-            if "bias" in tensors and getattr(target_mod, "bias", None) is not None:
-                target_mod.bias = torch.nn.Parameter(
-                    tensors["bias"].to(dtype=eager_dtype, device=target_device),
-                    requires_grad=False,
+
+            can_pack = (
+                _opts.pack_rtn_extras
+                and isinstance(target_mod, torch.nn.Linear)
+                and tuple(target_w.shape) == (out_f, in_f)
+            )
+            if can_pack:
+                bias_t = None
+                if "bias" in tensors and getattr(target_mod, "bias", None) is not None:
+                    bias_t = tensors["bias"].to(dtype=eager_dtype, device=target_device)
+                packed = PackedRTNLinear(
+                    in_features=in_f,
+                    out_features=out_f,
+                    qweight_u8=tensors["qweight_u8"].to(target_device),
+                    scales=tensors["scales"].to(dtype=eager_dtype, device=target_device),
+                    zeros=tensors["zeros"].to(dtype=eager_dtype, device=target_device),
+                    bias=bias_t,
                 )
+                parent_name, _, child_name = name.rpartition(".")
+                parent = model
+                if parent_name:
+                    for part in parent_name.split("."):
+                        parent = getattr(parent, part)
+                setattr(parent, child_name, packed)
+                modules_now[name] = packed
+                packed_count += 1
+            else:
+                weight = dequant_extra_u8_to_weight(
+                    tensors["qweight_u8"], tensors["scales"], tensors["zeros"],
+                    in_f, out_f, eager_dtype,
+                ).to(target_device)
+                with torch.no_grad():
+                    # Some "extras" are non-Linear (RMSNorm q_norm/k_norm stored
+                    # with shape (heads, head_dim) but packed as if (in=head_dim,
+                    # out=heads)). Reshape into the target module's parameter shape
+                    # in those cases so we don't corrupt the module class.
+                    if target_w.shape == weight.shape:
+                        target_mod.weight = torch.nn.Parameter(weight, requires_grad=False)
+                    elif target_w.numel() == weight.numel():
+                        target_mod.weight = torch.nn.Parameter(
+                            weight.reshape(target_w.shape).contiguous(),
+                            requires_grad=False,
+                        )
+                    else:
+                        raise RuntimeError(
+                            f"extra-quant shape mismatch at {name}: target "
+                            f"{tuple(target_w.shape)} vs decoded {tuple(weight.shape)}"
+                        )
+                if "bias" in tensors and getattr(target_mod, "bias", None) is not None:
+                    target_mod.bias = torch.nn.Parameter(
+                        tensors["bias"].to(dtype=eager_dtype, device=target_device),
+                        requires_grad=False,
+                    )
             extra_count += 1
         _PENDING_EXTRA.clear()
-        print(f"[irodori_tts_lite] extra_quant_dequanted={extra_count}")
+        print(
+            f"[irodori_tts_lite] extra_quant: total={extra_count} "
+            f"(packed={packed_count}, eager_dequant={extra_count - packed_count})"
+        )
+
+    if _PENDING_EMBED:
+        from .packed_linear import PackedEmbedding
+        modules_now = dict(model.named_modules())
+        embed_count = 0
+        for name, info in _PENDING_EMBED.items():
+            entry = info["entry"]
+            tensors = info["tensors"]
+            target_mod = modules_now.get(name)
+            if target_mod is None:
+                raise KeyError(f"embed-quant target not found in model: {name}")
+            packed = PackedEmbedding(
+                num_embeddings=int(entry["num_embeddings"]),
+                embedding_dim=int(entry["embedding_dim"]),
+                qweight_u8=tensors["qweight_u8"].to(target_device),
+                scales=tensors["scales"].to(dtype=eager_dtype, device=target_device),
+                zeros=tensors["zeros"].to(dtype=eager_dtype, device=target_device),
+                padding_idx=getattr(target_mod, "padding_idx", None),
+            )
+            parent_name, _, child_name = name.rpartition(".")
+            parent = model
+            if parent_name:
+                for part in parent_name.split("."):
+                    parent = getattr(parent, part)
+            setattr(parent, child_name, packed)
+            embed_count += 1
+        _PENDING_EMBED.clear()
+        print(f"[irodori_tts_lite] embed_quant: packed {embed_count} embedding tables")
+
+    if donor_duration_state:
+        model_state.update(donor_duration_state)
 
     missing, unexpected = model.load_state_dict(model_state, strict=False)
     if unexpected:

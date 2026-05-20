@@ -36,7 +36,6 @@ Generate speech with Irodori options:
 curl http://127.0.0.1:8088/v1/audio/speech \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "irodori-tts-lite",
     "input": "こんにちは。",
     "irodori": {
       "num_steps": 24,
@@ -44,25 +43,6 @@ curl http://127.0.0.1:8088/v1/audio/speech \
     }
   }' \
   --output speech.wav
-```
-
-## OpenAI SDK
-
-```python
-from openai import OpenAI
-
-client = OpenAI(
-    base_url="http://127.0.0.1:8088/v1",
-    api_key="not-used",
-)
-
-with client.audio.speech.with_streaming_response.create(
-    model="irodori-tts-lite",
-    voice="none",
-    input="こんにちは。",
-    response_format="wav",
-) as response:
-    response.stream_to_file("speech.wav")
 ```
 
 ## Irodori Options
@@ -101,18 +81,34 @@ All settings use the `IRODORI_` environment prefix.
 | `IRODORI_HOST`               | `127.0.0.1`                                  |
 | `IRODORI_PORT`               | `8088`                                       |
 | `IRODORI_API_KEY`            | unset                                        |
-| `IRODORI_CHECKPOINT`         | unset                                        |
-| `IRODORI_HF_CHECKPOINT`      | `arata-ae/irodori-archive`                   |
-| `IRODORI_HF_CHECKPOINT_FILE` | `Irodori-TTS-Lite-int4/dit_int4.safetensors` |
-| `IRODORI_MODEL_NAME`         | `irodori-tts-lite`                           |
+| `IRODORI_CHECKPOINT_FILE`    | `arata-ae/irodori-archive/Irodori-TTS-Lite-int4/dit_int4.safetensors` |
 | `IRODORI_MODEL_DEVICE`       | `auto`                                       |
 | `IRODORI_CODEC_DEVICE`       | `cpu`                                        |
 | `IRODORI_VOICES_DIR`         | `voices`                                     |
 | `IRODORI_DEFAULT_VOICE`      | `none`                                       |
 | `IRODORI_DEFAULT_NUM_STEPS`  | `40`                                         |
 | `IRODORI_CODEC_INT4`         | `false`                                      |
+| `IRODORI_PACK_RTN_EXTRAS`    | `true`                                       |
+| `IRODORI_HF_DURATION_DONOR`  | `arata-ae/irodori-archive/Irodori-TTS-500M-v3-int4/model.safetensors` |
 
-The default checkpoint is downloaded from Hugging Face on first startup unless `IRODORI_CHECKPOINT` points to a local file.
+`IRODORI_CHECKPOINT_FILE` accepts either a Hugging Face checkpoint spec in `<org>/<repo>/<filename>` form or a local file path.
+
+To run v3 directly:
+
+```bash
+IRODORI_CHECKPOINT_FILE=arata-ae/irodori-archive/Irodori-TTS-500M-v3-int4/model.safetensors \
+uv run irodori-api
+```
+
+You can also hot-swap per request with the OpenAI `model` field. Omitting it uses `IRODORI_CHECKPOINT_FILE`; `irodori-tts-v2` and `irodori-tts-v3` lazy-load and cache their checkpoints on first use.
+
+### Duration donor for v2
+
+The default `IRODORI_CHECKPOINT_FILE` is the v2 Lite checkpoint. Because v2 does not include a learned duration predictor, Irodori-API also defaults `IRODORI_HF_DURATION_DONOR` to the v3 int4 checkpoint from `arata-ae/irodori-archive`. On startup, the loader first reads the main checkpoint config. If `use_duration_predictor` is false, it opens the donor checkpoint and copies only its duration config and `duration_predictor.*` tensors into the runtime.
+
+If you set `IRODORI_CHECKPOINT_FILE` to the v3 checkpoint, the main model already has `use_duration_predictor=true`, so the donor is skipped.
+
+When a duration predictor is available, requests without explicit `irodori.seconds` use model-predicted duration. `irodori.duration_scale`, `irodori.min_seconds`, and `irodori.max_seconds` still apply. If you set `irodori.seconds`, that manual duration wins. Set `IRODORI_HF_DURATION_DONOR=` to disable donor grafting for v2.
 
 ## Notes
 

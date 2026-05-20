@@ -23,35 +23,31 @@ class RuntimeLoadTimeoutError(TimeoutError):
 class RuntimeManager:
     def __init__(self, settings) -> None:
         self.settings = settings
-        self._runtime = None
-        self._checkpoint_path: str | None = None
-        self._loading = False
+        self._runtimes: dict[str, object] = {}
+        self._checkpoint_paths: dict[str, str] = {}
+        self._loading: set[str] = set()
         self._condition = threading.Condition()
 
     @property
     def is_loaded(self) -> bool:
-        return self._runtime is not None
+        return bool(self._runtimes)
 
     @property
     def is_loading(self) -> bool:
-        return self._loading
+        return bool(self._loading)
 
     @property
     def checkpoint_path(self) -> str | None:
-        return self._checkpoint_path
+        return self._checkpoint_paths.get(str(self.settings.checkpoint_file).strip())
 
-    def _resolve_checkpoint_path(self) -> str:
-        checkpoint = self.settings.checkpoint
-        filename = str(self.settings.hf_checkpoint_file).strip()
-        if checkpoint is None and not str(self.settings.hf_checkpoint).strip():
-            raise ValueError("Set IRODORI_CHECKPOINT or IRODORI_HF_CHECKPOINT.")
-        if checkpoint is None and filename == "":
-            raise ValueError("Set IRODORI_HF_CHECKPOINT_FILE.")
-        return irodori_tts_lite.resolve_checkpoint(
-            checkpoint,
-            default_repo=self.settings.hf_checkpoint,
-            default_filename=filename,
-        )
+    @property
+    def checkpoint_paths(self) -> dict[str, str]:
+        return dict(self._checkpoint_paths)
+
+    def _resolve_checkpoint_path(self, checkpoint_file: str) -> str:
+        if not checkpoint_file:
+            raise ValueError("Set IRODORI_CHECKPOINT_FILE.")
+        return irodori_tts_lite.resolve_checkpoint(checkpoint_file)
 
     @staticmethod
     def _resolve_device(value: str) -> str:
@@ -67,26 +63,29 @@ class RuntimeManager:
             return "mps"
         return "cpu"
 
-    def get(self):
+    def get(self, checkpoint_file: str | None = None):
+        checkpoint_key = str(checkpoint_file or self.settings.checkpoint_file).strip()
+        if not checkpoint_key:
+            raise ValueError("Set IRODORI_CHECKPOINT_FILE.")
         with self._condition:
-            if self._runtime is not None:
-                return self._runtime
-            if self._loading:
+            if checkpoint_key in self._runtimes:
+                return self._runtimes[checkpoint_key]
+            if checkpoint_key in self._loading:
                 deadline = time.monotonic() + float(self.settings.model_load_timeout)
-                while self._loading and self._runtime is None:
+                while checkpoint_key in self._loading and checkpoint_key not in self._runtimes:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
                         raise RuntimeLoadTimeoutError("Timed out waiting for runtime load.")
                     self._condition.wait(timeout=remaining)
-                if self._runtime is None:
+                if checkpoint_key not in self._runtimes:
                     raise RuntimeLoadTimeoutError("Runtime load failed.")
-                return self._runtime
-            self._loading = True
+                return self._runtimes[checkpoint_key]
+            self._loading.add(checkpoint_key)
 
         try:
-            logger.info("loading runtime")
+            logger.info("loading runtime for %s", checkpoint_key)
             started = time.perf_counter()
-            checkpoint_path = self._resolve_checkpoint_path()
+            checkpoint_path = self._resolve_checkpoint_path(checkpoint_key)
             logger.info("checkpoint resolved: %s", checkpoint_path)
             irodori_tts_lite.configure(
                 use_fused=self.settings.use_fused,
@@ -94,6 +93,8 @@ class RuntimeManager:
                 disable_eager=self.settings.disable_eager_dequant,
                 codec_int4=self.settings.codec_int4,
                 codec_int4_groupsize=self.settings.codec_int4_groupsize,
+                pack_rtn_extras=self.settings.pack_rtn_extras,
+                duration_donor=(str(self.settings.hf_duration_donor).strip() or None),
             )
             irodori_tts_lite.patch()
             model_device = self._resolve_device(self.settings.model_device)
@@ -112,13 +113,13 @@ class RuntimeManager:
             logger.info("runtime loaded in %.2fs", time.perf_counter() - started)
         except Exception:
             with self._condition:
-                self._loading = False
+                self._loading.discard(checkpoint_key)
                 self._condition.notify_all()
             raise
 
         with self._condition:
-            self._runtime = runtime
-            self._checkpoint_path = checkpoint_path
-            self._loading = False
+            self._runtimes[checkpoint_key] = runtime
+            self._checkpoint_paths[checkpoint_key] = checkpoint_path
+            self._loading.discard(checkpoint_key)
             self._condition.notify_all()
             return runtime

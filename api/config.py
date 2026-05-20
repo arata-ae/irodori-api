@@ -5,7 +5,11 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from irodori_tts_lite.weights import DEFAULT_DIT_FILE, DEFAULT_REPO
+from irodori_tts_lite.weights import (
+    DEFAULT_CHECKPOINT_FILE,
+    DEFAULT_HF_DURATION_DONOR,
+    model_name_from_checkpoint_file,
+)
 
 
 class Settings(BaseSettings):
@@ -16,10 +20,11 @@ class Settings(BaseSettings):
     api_key: str | None = None
     cors_origins: list[str] = Field(default_factory=list)
 
-    checkpoint: str | None = None
-    hf_checkpoint: str = DEFAULT_REPO
-    hf_checkpoint_file: str = DEFAULT_DIT_FILE
-    model_name: str = "irodori-tts-lite"
+    checkpoint_file: str = DEFAULT_CHECKPOINT_FILE
+
+    @property
+    def effective_model_name(self) -> str:
+        return model_name_from_checkpoint_file(self.checkpoint_file)
 
     model_device: str = "auto"
     codec_device: str = "cpu"
@@ -30,6 +35,8 @@ class Settings(BaseSettings):
     disable_eager_dequant: bool = False
     codec_int4: bool = False
     codec_int4_groupsize: int = 32
+    pack_rtn_extras: bool = True
+    hf_duration_donor: str | None = DEFAULT_HF_DURATION_DONOR
     compile_model: bool = False
     compile_dynamic: bool = False
 

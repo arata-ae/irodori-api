@@ -24,10 +24,19 @@ from .packed_conv import (
     replace_conv_with_packed,
 )
 from .weights import (
+    DEFAULT_CHECKPOINT_FILE,
     DEFAULT_DACVAE_FILE,
     DEFAULT_DIT_FILE,
+    DEFAULT_HF_DURATION_DONOR,
     DEFAULT_REPO,
+    V2_DIT_FILE,
+    V2_MODEL_NAME,
+    V3_DIT_FILE,
+    V3_MODEL_NAME,
+    checkpoint_file_from_model_name,
+    model_name_from_checkpoint_file,
     resolve_checkpoint,
+    resolve_hf_checkpoint,
 )
 
 __all__ = [
@@ -39,9 +48,18 @@ __all__ = [
     "PackedInt4ConvTranspose1d",
     "replace_conv_with_packed",
     "resolve_checkpoint",
+    "DEFAULT_CHECKPOINT_FILE",
     "DEFAULT_REPO",
     "DEFAULT_DIT_FILE",
     "DEFAULT_DACVAE_FILE",
+    "DEFAULT_HF_DURATION_DONOR",
+    "V2_DIT_FILE",
+    "V2_MODEL_NAME",
+    "V3_DIT_FILE",
+    "V3_MODEL_NAME",
+    "checkpoint_file_from_model_name",
+    "model_name_from_checkpoint_file",
+    "resolve_hf_checkpoint",
 ]
 
 __version__ = "0.1.0"

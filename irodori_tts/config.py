@@ -45,6 +45,9 @@ class ModelConfig:
     duration_architecture: str = "token_sum_adarn_zero_no_aux"
     duration_token_init_frames: float = 9.0
     duration_speaker_fusion: str = "adarn_zero"
+    duration_predictor_uncertainty: bool = False
+    duration_uncertainty_min_log_scale: float = -7.0
+    duration_uncertainty_max_log_scale: float = 5.0
 
     @property
     def patched_latent_dim(self) -> int:
