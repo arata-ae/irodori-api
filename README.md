@@ -64,6 +64,7 @@ Supported response formats: `wav`, `mp3`, `flac`, `opus`, `pcm`.
 | Endpoint                             | Description             |
 | ------------------------------------ | ----------------------- |
 | `GET /health`                        | Runtime status          |
+| `GET /ping`                          | RunPod health check     |
 | `GET /v1/models`                     | Model list              |
 | `POST /v1/audio/speech`              | Speech synthesis        |
 | `GET /v1/audio/voices`               | List reference voices   |
@@ -71,6 +72,39 @@ Supported response formats: `wav`, `mp3`, `flac`, `opus`, `pcm`.
 | `GET /v1/audio/voices/{voice_id}`    | Get voice metadata      |
 | `PUT /v1/audio/voices/{voice_id}`    | Replace reference voice |
 | `DELETE /v1/audio/voices/{voice_id}` | Delete reference voice  |
+
+## RunPod Serverless
+
+Use a custom GitHub deployment for this repo.
+
+1. Create a new deployment and choose `Custom deployment`.
+2. Select the `irodori-api` GitHub repository.
+3. Use the branch you want to deploy and set Dockerfile path to `Dockerfile`.
+4. Set endpoint type to `Load Balancer`, not `Queue`.
+5. Select the `L4 / A5000 / RTX 3090 24 GB` GPU group, with `L4` as the preferred GPU.
+6. Expose HTTP port `80`.
+7. Set GPUs per worker to `1`.
+8. For Japan/SEA latency tests, prefer APAC data centers such as `AP-JP-1` and `OC-AU-1` when capacity is available. If APAC capacity is unavailable, loosen the data-center filter for dev smoke tests.
+9. For dev, start with active workers `0` and max workers `1`. For realtime demos, set active workers to `1`.
+
+If RunPod asks for a minimum CUDA version, select CUDA `12.4` or newer. The Docker image installs CUDA 12.4 PyTorch wheels for broad L4 compatibility.
+
+After deployment, test:
+
+```bash
+curl https://ENDPOINT_ID.api.runpod.ai/ping \
+  -H "Authorization: Bearer RUNPOD_API_KEY"
+
+curl https://ENDPOINT_ID.api.runpod.ai/v1/audio/speech \
+  -H "Authorization: Bearer RUNPOD_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"input":"こんにちは。これはIrodori-APIのテストです。","response_format":"mp3"}' \
+  --output speech.mp3
+```
+
+`/ping` reports process health for RunPod. Use `/health` to inspect runtime warmup state before sending synthesis requests.
+
+RunPod GitHub deployments build from the repo and Dockerfile. After changing the repo, trigger a new RunPod build from the console or create a GitHub release if your endpoint is configured to deploy releases.
 
 ## Configuration
 
@@ -80,7 +114,6 @@ All settings use the `IRODORI_` environment prefix.
 | ---------------------------- | -------------------------------------------- |
 | `IRODORI_HOST`               | `127.0.0.1`                                  |
 | `IRODORI_PORT`               | `8088`                                       |
-| `IRODORI_API_KEY`            | unset                                        |
 | `IRODORI_CHECKPOINT_FILE`    | `arata-ae/irodori-archive/Irodori-TTS-Lite-int4/dit_int4.safetensors` |
 | `IRODORI_MODEL_DEVICE`       | `auto`                                       |
 | `IRODORI_CODEC_DEVICE`       | `cpu`                                        |
@@ -92,6 +125,8 @@ All settings use the `IRODORI_` environment prefix.
 | `IRODORI_HF_DURATION_DONOR`  | `arata-ae/irodori-archive/Irodori-TTS-500M-v3-int4/model.safetensors` |
 
 `IRODORI_CHECKPOINT_FILE` accepts either a Hugging Face checkpoint spec in `<org>/<repo>/<filename>` form or a local file path.
+
+For production GPU deployments, set `IRODORI_CODEC_DEVICE=cuda` so codec decoding stays on the GPU.
 
 To run v3 directly:
 

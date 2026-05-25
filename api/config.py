@@ -17,7 +17,6 @@ class Settings(BaseSettings):
 
     host: str = "127.0.0.1"
     port: int = 8088
-    api_key: str | None = None
     cors_origins: list[str] = Field(default_factory=list)
 
     checkpoint_file: str = DEFAULT_CHECKPOINT_FILE

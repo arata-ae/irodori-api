@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from functools import partial
 from typing import Any, Literal
 
-import torch
 import irodori_tts_lite
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
+import torch
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
@@ -36,6 +37,8 @@ runtime_manager = RuntimeManager(settings)
 voice_registry = VoiceRegistry(settings)
 _synthesis_semaphore: asyncio.Semaphore | None = None
 _synthesis_semaphore_limit: int | None = None
+_runtime_warmup_task: asyncio.Task | None = None
+_runtime_warmup_error: str | None = None
 
 
 class IrodoriOptions(BaseModel):
@@ -96,14 +99,29 @@ class SpeechRequest(BaseModel):
 def startup() -> None:
     voices_dir = voice_registry.ensure_dir()
     logger.info("voices directory: %s", voices_dir)
-    logger.info("loading runtime during startup")
-    runtime_manager.get()
+
+
+async def warm_default_runtime() -> None:
+    global _runtime_warmup_error
+    _runtime_warmup_error = None
+    logger.info("warming default runtime")
+    try:
+        await asyncio.to_thread(runtime_manager.get)
+    except Exception as exc:
+        _runtime_warmup_error = str(exc)
+        logger.exception("default runtime warmup failed")
+    else:
+        logger.info("default runtime warmup completed")
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    global _runtime_warmup_task
     startup()
+    _runtime_warmup_task = asyncio.create_task(warm_default_runtime())
     yield
+    if _runtime_warmup_task is not None and not _runtime_warmup_task.done():
+        _runtime_warmup_task.cancel()
 
 
 app = FastAPI(title="Irodori-API", version="0.1.0", lifespan=lifespan)
@@ -118,18 +136,32 @@ if settings.cors_origins:
     )
 
 
-def require_auth(authorization: str | None = Header(default=None)) -> None:
-    if settings.api_key is None:
-        return
-    if authorization != f"Bearer {settings.api_key}":
-        raise HTTPException(status_code=401, detail="Invalid API key.")
-
-
 def openai_error_response(message: str, *, status_code: int, error_type: str) -> JSONResponse:
     return JSONResponse(
         status_code=status_code,
         content={"error": {"message": message, "type": error_type, "param": None, "code": None}},
     )
+
+
+def cuda_status() -> dict[str, Any]:
+    status: dict[str, Any] = {
+        "torch_version": torch.__version__,
+        "torch_cuda_version": torch.version.cuda,
+        "cuda_built": bool(torch.backends.cuda.is_built()),
+        "cuda_available": False,
+        "device_count": 0,
+        "device_name": None,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "nvidia_visible_devices": os.environ.get("NVIDIA_VISIBLE_DEVICES"),
+    }
+    try:
+        status["cuda_available"] = bool(torch.cuda.is_available())
+        status["device_count"] = int(torch.cuda.device_count())
+        if status["cuda_available"] and status["device_count"] > 0:
+            status["device_name"] = torch.cuda.get_device_name(0)
+    except Exception as exc:
+        status["error"] = str(exc)
+    return status
 
 
 @app.exception_handler(HTTPException)
@@ -162,8 +194,13 @@ async def unhandled_exception_handler(_request: Request, exc: Exception) -> JSON
 @app.get("/health")
 def health() -> dict[str, Any]:
     voices_dir = settings.voices_dir.expanduser()
+    status = "ok"
+    if _runtime_warmup_error is not None:
+        status = "error"
+    elif not runtime_manager.is_loaded:
+        status = "loading"
     return {
-        "status": "ok",
+        "status": status,
         "model": {
             "id": settings.effective_model_name,
             "checkpoint_file": settings.checkpoint_file,
@@ -184,6 +221,8 @@ def health() -> dict[str, Any]:
         "runtime": {
             "loaded": runtime_manager.is_loaded,
             "loading": runtime_manager.is_loading,
+            "warmup_error": _runtime_warmup_error,
+            "cuda": cuda_status(),
             "checkpoint": runtime_manager.checkpoint_path,
             "checkpoints": runtime_manager.checkpoint_paths,
             "load_timeout": settings.model_load_timeout,
@@ -211,7 +250,12 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.get("/v1/models", dependencies=[Depends(require_auth)])
+@app.get("/ping")
+def ping() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/v1/models")
 def list_models() -> dict[str, Any]:
     return {
         "object": "list",
@@ -232,12 +276,12 @@ def list_models() -> dict[str, Any]:
     }
 
 
-@app.get("/v1/audio/voices", dependencies=[Depends(require_auth)])
+@app.get("/v1/audio/voices")
 def list_voices() -> dict[str, Any]:
     return {"object": "list", "data": [voice.metadata() for voice in voice_registry.list()]}
 
 
-@app.post("/v1/audio/voices", status_code=201, dependencies=[Depends(require_auth)])
+@app.post("/v1/audio/voices", status_code=201)
 async def upload_voice(file: UploadFile = File(...), voice_id: str | None = Form(default=None)):
     try:
         voice_file = voice_registry.write_file(
@@ -253,7 +297,7 @@ async def upload_voice(file: UploadFile = File(...), voice_id: str | None = Form
     return JSONResponse(status_code=201, content=voice_file.metadata())
 
 
-@app.get("/v1/audio/voices/{voice_id}", dependencies=[Depends(require_auth)])
+@app.get("/v1/audio/voices/{voice_id}")
 def get_voice_file(voice_id: str) -> dict[str, Any]:
     voice = voice_registry.get_file(voice_id)
     if voice is None:
@@ -261,7 +305,7 @@ def get_voice_file(voice_id: str) -> dict[str, Any]:
     return voice.metadata()
 
 
-@app.put("/v1/audio/voices/{voice_id}", dependencies=[Depends(require_auth)])
+@app.put("/v1/audio/voices/{voice_id}")
 async def replace_voice(voice_id: str, file: UploadFile = File(...)) -> dict[str, Any]:
     try:
         voice = voice_registry.write_file(
@@ -275,7 +319,7 @@ async def replace_voice(voice_id: str, file: UploadFile = File(...)) -> dict[str
     return voice.metadata()
 
 
-@app.delete("/v1/audio/voices/{voice_id}", dependencies=[Depends(require_auth)])
+@app.delete("/v1/audio/voices/{voice_id}")
 def delete_voice(voice_id: str) -> dict[str, Any]:
     if not voice_registry.delete(voice_id):
         raise HTTPException(status_code=404, detail=f"Voice {voice_id!r} was not found.")
@@ -359,7 +403,7 @@ def _synthesize_sync(runtime, req: SpeechRequest):
     return _concat_results(results)
 
 
-@app.post("/v1/audio/speech", dependencies=[Depends(require_auth)])
+@app.post("/v1/audio/speech")
 async def create_speech(req: SpeechRequest) -> Response:
     if req.stream_format is not None:
         raise HTTPException(status_code=400, detail="Streaming synthesis is not implemented.")
@@ -388,7 +432,7 @@ async def create_speech(req: SpeechRequest) -> Response:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
-        runtime = runtime_manager.get(checkpoint_file)
+        runtime = await asyncio.to_thread(runtime_manager.get, checkpoint_file)
     except RuntimeLoadTimeoutError as exc:
         raise HTTPException(status_code=504, detail="Runtime load timed out.") from exc
 
