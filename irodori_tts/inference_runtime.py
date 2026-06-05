@@ -1245,7 +1245,10 @@ def clear_cached_runtime() -> None:
 def _load_audio(path: str | Path) -> tuple[torch.Tensor, int]:
     try:
         return torchaudio.load(str(path))
-    except RuntimeError:
+    except (RuntimeError, ImportError):
+        # newer torchaudio routes .load() through TorchCodec and raises ImportError when it's
+        # absent (older builds raised RuntimeError on backend issues). soundfile reads wav/flac/ogg
+        # via libsndfile with no extra codec, so fall back to it either way.
         import soundfile as sf
 
         data, sr = sf.read(str(path), dtype="float32")
@@ -1263,7 +1266,8 @@ def save_wav(path: str | Path, audio: torch.Tensor, sample_rate: int) -> Path:
     audio_cpu = audio.detach().to(device="cpu", dtype=torch.float32)
     try:
         torchaudio.save(str(out_path), audio_cpu, sample_rate)
-    except RuntimeError:
+    except (RuntimeError, ImportError):
+        # same as _load_audio: torchaudio i/o may need TorchCodec (ImportError) — fall back to soundfile
         import soundfile as sf
 
         audio_np = audio_cpu.squeeze(0).numpy() if audio_cpu.shape[0] == 1 else audio_cpu.T.numpy()
