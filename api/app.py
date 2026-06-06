@@ -344,8 +344,24 @@ def _request_kwargs(req: SpeechRequest, text: str, seconds: float | None) -> dic
         "min_seconds": options.min_seconds or settings.default_auto_min_seconds,
         "max_seconds": options.max_seconds or settings.default_max_seconds,
         "num_steps": options.num_steps or settings.default_num_steps,
+        "t_schedule_mode": options.t_schedule_mode or settings.default_t_schedule_mode,
+        "sway_coeff": (
+            settings.default_sway_coeff
+            if options.sway_coeff is None
+            else options.sway_coeff
+        ),
+        "cfg_guidance_mode": options.cfg_guidance_mode or settings.default_cfg_guidance_mode,
         "seed": options.seed,
     }
+    if options.cfg_scale is not None:
+        kwargs["cfg_scale"] = options.cfg_scale
+    elif (
+        settings.default_cfg_scale is not None
+        and options.cfg_scale_text is None
+        and options.cfg_scale_caption is None
+        and options.cfg_scale_speaker is None
+    ):
+        kwargs["cfg_scale"] = settings.default_cfg_scale
     for name, value in options.model_dump(exclude_none=True).items():
         if name not in kwargs and hasattr(SamplingRequest, "__dataclass_fields__"):
             if name in SamplingRequest.__dataclass_fields__:
@@ -367,7 +383,38 @@ def _concat_results(results: list[Any]):
     if len(results) == 1:
         return first
     audio = torch.cat([result.audio.detach().cpu().reshape(-1) for result in results], dim=0)
-    return replace(first, audio=audio, audios=[audio], total_to_decode=sum(r.total_to_decode for r in results))
+    updates: dict[str, Any] = {
+        "audio": audio,
+        "audios": [audio],
+        "total_to_decode": sum(r.total_to_decode for r in results),
+    }
+    if hasattr(first, "stage_timings"):
+        updates["stage_timings"] = [
+            (f"chunk{index}.{name}", seconds)
+            for index, result in enumerate(results)
+            for name, seconds in getattr(result, "stage_timings", [])
+        ]
+    return replace(first, **updates)
+
+
+def _stage_timings(result: Any) -> list[tuple[str, float]]:
+    timings = getattr(result, "stage_timings", None)
+    if not timings:
+        return []
+    return [(str(name), float(seconds)) for name, seconds in timings]
+
+
+def _timing_headers(result: Any) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    total_to_decode = getattr(result, "total_to_decode", None)
+    if total_to_decode is not None:
+        headers["X-Irodori-Total-To-Decode"] = f"{float(total_to_decode):.6f}"
+    timings = _stage_timings(result)
+    if timings:
+        headers["X-Irodori-Stage-Timings"] = ",".join(
+            f"{name};dur={seconds:.6f}" for name, seconds in timings
+        )
+    return headers
 
 
 def _request_with_seed(req: SpeechRequest) -> SpeechRequest:
@@ -525,20 +572,26 @@ async def _stream_speech_lines(
             audio_seconds = float(result.audio.numel()) / float(result.sample_rate)
             total_audio_seconds += audio_seconds
             total_bytes += len(audio_bytes)
-            yield _ndjson_line(
-                {
-                    "type": "chunk",
-                    "index": index,
-                    "chunks": len(texts),
-                    "text": text,
-                    "audio": base64.b64encode(audio_bytes).decode("ascii"),
-                    "format": response_format,
-                    "mime_type": CONTENT_TYPES[response_format],
-                    "audio_seconds": audio_seconds,
-                    "sample_rate": int(result.sample_rate),
-                    "seed": getattr(result, "used_seed", request.irodori.seed),
+            payload: dict[str, Any] = {
+                "type": "chunk",
+                "index": index,
+                "chunks": len(texts),
+                "text": text,
+                "audio": base64.b64encode(audio_bytes).decode("ascii"),
+                "format": response_format,
+                "mime_type": CONTENT_TYPES[response_format],
+                "audio_seconds": audio_seconds,
+                "sample_rate": int(result.sample_rate),
+                "seed": getattr(result, "used_seed", request.irodori.seed),
+                "total_to_decode": float(getattr(result, "total_to_decode", 0.0)),
+            }
+            timings = _stage_timings(result)
+            if timings:
+                payload["stage_timings"] = {
+                    name: seconds
+                    for name, seconds in timings
                 }
-            )
+            yield _ndjson_line(payload)
 
     elapsed = time.perf_counter() - started
     logger.info(
@@ -628,7 +681,10 @@ async def create_speech(req: SpeechRequest) -> Response:
         len(audio_bytes),
         getattr(result, "used_seed", None),
     )
-    headers = {"X-Irodori-Seed": str(getattr(result, "used_seed", ""))}
+    headers = {
+        "X-Irodori-Seed": str(getattr(result, "used_seed", "")),
+        **_timing_headers(result),
+    }
     return Response(
         content=audio_bytes,
         media_type=CONTENT_TYPES[response_format],

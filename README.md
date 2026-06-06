@@ -137,13 +137,33 @@ All settings use the `IRODORI_` environment prefix.
 | `IRODORI_VOICES_DIR`         | `voices`                                     |
 | `IRODORI_DEFAULT_VOICE`      | `none`                                       |
 | `IRODORI_DEFAULT_NUM_STEPS`  | `24`                                         |
+| `IRODORI_DEFAULT_T_SCHEDULE_MODE` | `linear`                               |
+| `IRODORI_DEFAULT_SWAY_COEFF` | `-1.0`                                       |
+| `IRODORI_DEFAULT_CFG_GUIDANCE_MODE` | `independent`                          |
+| `IRODORI_DEFAULT_CFG_SCALE`  | unset                                        |
 | `IRODORI_CODEC_INT4`         | `false`                                      |
 | `IRODORI_PACK_RTN_EXTRAS`    | `true`                                       |
 | `IRODORI_HF_DURATION_DONOR`  | `arata-ae/irodori-archive/Irodori-TTS-500M-v3-int4/model.safetensors` |
 
 `IRODORI_CHECKPOINT_FILE` accepts either a Hugging Face checkpoint spec in `<org>/<repo>/<filename>` form or a local file path.
 
-For production GPU deployments, set `IRODORI_CODEC_DEVICE=cuda` so codec decoding stays on the GPU.
+For Linux CUDA deployments, set `IRODORI_CODEC_DEVICE=cuda` so codec decoding stays on the GPU.
+
+For low-latency macOS experiments, start with:
+
+```bash
+PYTORCH_ENABLE_MPS_FALLBACK=1
+IRODORI_MODEL_DEVICE=mps
+IRODORI_DEFAULT_NUM_STEPS=6
+IRODORI_DEFAULT_T_SCHEDULE_MODE=sway
+IRODORI_DEFAULT_SWAY_COEFF=-1.0
+IRODORI_DEFAULT_CFG_GUIDANCE_MODE=joint
+IRODORI_DEFAULT_CFG_SCALE=3
+```
+
+Then benchmark `IRODORI_CODEC_DEVICE=mps` versus the default `cpu`; DACVAE decode may be faster on MPS, but fallback-heavy runs can lose time to device transfers.
+
+For repeated voice-clone requests, prefer `irodori.ref_latent` or `irodori.ref_embed` over re-encoding the same `ref_wav` every request.
 
 To run v3 directly:
 

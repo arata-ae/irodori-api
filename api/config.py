@@ -43,6 +43,10 @@ class Settings(BaseSettings):
     default_voice: str = "none"
     default_response_format: str = "wav"
     default_num_steps: int = 24
+    default_t_schedule_mode: str = "linear"
+    default_sway_coeff: float = -1.0
+    default_cfg_guidance_mode: str = "independent"
+    default_cfg_scale: float | None = None
     default_auto_seconds: bool = True
     default_auto_min_seconds: float = 2.0
     default_auto_seconds_scale: float = 1.25
