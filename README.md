@@ -51,9 +51,13 @@ Supported response formats: `wav`, `mp3`, `flac`, `opus`, `pcm`.
 
 | Option             | Description                                        |
 | ------------------ | -------------------------------------------------- |
-| `num_steps`        | Sampling steps. Defaults to `40`.                  |
+| `num_steps`        | Sampling steps. Defaults to `24`.                  |
+| `no_ref`           | Uses a seed-derived synthetic speaker reference.   |
+| `ref_wav`          | Path to a reference WAV for speaker conditioning.  |
 | `seconds`          | Manual target duration before runtime clamping.    |
 | `seed`             | Reproducible generation seed.                      |
+| `cfg_guidance_mode`| `independent`, `joint`, or `alternating`.          |
+| `cfg_scale`        | Shared CFG scale for enabled guidance branches.    |
 | `duration_scale`   | Scales automatic duration estimates.               |
 | `chunking_enabled` | Splits long text into chunks before synthesis.     |
 | `chunk_min_chars`  | Minimum chunk size when chunking is enabled.       |
@@ -119,7 +123,7 @@ All settings use the `IRODORI_` environment prefix.
 | `IRODORI_CODEC_DEVICE`       | `cpu`                                        |
 | `IRODORI_VOICES_DIR`         | `voices`                                     |
 | `IRODORI_DEFAULT_VOICE`      | `none`                                       |
-| `IRODORI_DEFAULT_NUM_STEPS`  | `40`                                         |
+| `IRODORI_DEFAULT_NUM_STEPS`  | `24`                                         |
 | `IRODORI_CODEC_INT4`         | `false`                                      |
 | `IRODORI_PACK_RTN_EXTRAS`    | `true`                                       |
 | `IRODORI_HF_DURATION_DONOR`  | `arata-ae/irodori-archive/Irodori-TTS-500M-v3-int4/model.safetensors` |

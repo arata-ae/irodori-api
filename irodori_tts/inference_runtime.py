@@ -661,17 +661,21 @@ class InferenceRuntime:
                 )
             return None, None
         if req.no_ref:
+            messages.append("info: using seed-derived synthetic speaker reference.")
             ref_len = max(1, int(self.model_cfg.speaker_patch_size))
-            ref_latent_patched = torch.zeros(
-                (
-                    batch_size,
-                    ref_len,
-                    self.model_cfg.latent_dim * self.model_cfg.latent_patch_size,
-                ),
-                device=self.model_device,
-                dtype=runtime_dtype,
-            )
-            ref_mask = torch.zeros(
+            ref_dim = self.model_cfg.latent_dim * self.model_cfg.latent_patch_size
+            synthetic_seed = 0 if req.seed is None else int(req.seed)
+            rng = torch.Generator(device="cpu").manual_seed(synthetic_seed)
+            ref_latent_patched = torch.randn(
+                (1, ref_len, ref_dim),
+                device="cpu",
+                dtype=torch.float32,
+                generator=rng,
+            ).to(device=self.model_device, dtype=runtime_dtype)
+            ref_latent_patched = ref_latent_patched * 0.5
+            if batch_size > 1:
+                ref_latent_patched = ref_latent_patched.repeat(batch_size, 1, 1)
+            ref_mask = torch.ones(
                 (batch_size, ref_len), dtype=torch.bool, device=self.model_device
             )
             return ref_latent_patched, ref_mask
@@ -922,6 +926,7 @@ class InferenceRuntime:
         else:
             used_seed = int(req.seed)
             _log(f"[runtime] using seed: {used_seed}")
+        req.seed = used_seed
         post_load_t0 = _measure_start(self.model_device, self.codec_device)
 
         with (

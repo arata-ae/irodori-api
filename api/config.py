@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     voices_dir: Path = Path("voices")
     default_voice: str = "none"
     default_response_format: str = "wav"
-    default_num_steps: int = 40
+    default_num_steps: int = 24
     default_auto_seconds: bool = True
     default_auto_min_seconds: float = 2.0
     default_auto_seconds_scale: float = 1.25
