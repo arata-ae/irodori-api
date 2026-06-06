@@ -45,6 +45,19 @@ curl http://127.0.0.1:8088/v1/audio/speech \
   --output speech.wav
 ```
 
+Stream chunked speech as newline-delimited JSON:
+
+```bash
+curl http://127.0.0.1:8088/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input": "こんにちは。これはIrodori-APIのテストです。",
+    "response_format": "wav",
+    "stream_format": "ndjson",
+    "irodori": { "chunking_enabled": true, "chunk_min_chars": 24, "seed": 1234 }
+  }'
+```
+
 ## Irodori Options
 
 Supported response formats: `wav`, `mp3`, `flac`, `opus`, `pcm`.
@@ -155,7 +168,7 @@ When a duration predictor is available, requests without explicit `irodori.secon
 - CUDA is the practical target for int4 inference.
 - macOS uses eager-dequant fallbacks because Triton is not installed there.
 - Set `PYTORCH_ENABLE_MPS_FALLBACK=1` on Apple Silicon.
-- Streaming synthesis is not implemented.
+- Streaming synthesis supports `stream_format: "ndjson"` or `"jsonl"`. Each chunk line contains base64-encoded audio in the requested `response_format`, followed by a final `done` line.
 
 ## Credits
 

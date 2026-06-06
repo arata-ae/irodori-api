@@ -1,20 +1,23 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import json
 import logging
 import os
+import secrets
 import time
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from functools import partial
-from typing import Any, Literal
+from typing import Any, AsyncIterator, Literal
 
 import irodori_tts_lite
 import torch
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from .audio import CONTENT_TYPES, encode_audio, normalize_response_format
@@ -37,6 +40,8 @@ runtime_manager = RuntimeManager(settings)
 voice_registry = VoiceRegistry(settings)
 _synthesis_semaphore: asyncio.Semaphore | None = None
 _synthesis_semaphore_limit: int | None = None
+STREAM_CONTENT_TYPES = {"ndjson": "application/x-ndjson"}
+STREAM_FORMAT_ALIASES = {"jsonl": "ndjson", "ndjson": "ndjson"}
 _runtime_warmup_task: asyncio.Task | None = None
 _runtime_warmup_error: str | None = None
 
@@ -365,11 +370,14 @@ def _concat_results(results: list[Any]):
     return replace(first, audio=audio, audios=[audio], total_to_decode=sum(r.total_to_decode for r in results))
 
 
-def _synthesize_sync(runtime, req: SpeechRequest):
-    manual_seconds = req.irodori.seconds
-    use_model_duration_predictor = bool(
-        getattr(getattr(runtime, "model_cfg", None), "use_duration_predictor", False)
-    )
+def _request_with_seed(req: SpeechRequest) -> SpeechRequest:
+    if req.irodori.seed is not None:
+        return req
+    irodori = req.irodori.model_copy(update={"seed": int(secrets.randbits(63))})
+    return req.model_copy(update={"irodori": irodori})
+
+
+def _request_texts(req: SpeechRequest) -> list[str]:
     chunking_enabled = (
         settings.default_chunking_enabled
         if req.irodori.chunking_enabled is None
@@ -377,36 +385,184 @@ def _synthesize_sync(runtime, req: SpeechRequest):
     )
     chunk_min_chars = req.irodori.chunk_min_chars or settings.default_chunk_min_chars
     texts = [req.input]
-    if manual_seconds is None and chunking_enabled:
+    if req.irodori.seconds is None and chunking_enabled:
         texts = split_text(req.input, min_chars=chunk_min_chars)
+    return texts
 
-    results = []
-    for text in texts:
-        seconds = manual_seconds
-        if (
-            seconds is None
-            and settings.default_auto_seconds
-            and not use_model_duration_predictor
-        ):
-            estimate = estimate_seconds(
+
+def _runtime_uses_duration_predictor(runtime) -> bool:
+    return bool(getattr(getattr(runtime, "model_cfg", None), "use_duration_predictor", False))
+
+
+def _chunk_seconds(
+    req: SpeechRequest,
+    text: str,
+    *,
+    use_model_duration_predictor: bool,
+) -> float | None:
+    seconds = req.irodori.seconds
+    if seconds is None and settings.default_auto_seconds and not use_model_duration_predictor:
+        estimate = estimate_seconds(
+            text,
+            min_seconds=req.irodori.min_seconds or settings.default_auto_min_seconds,
+            scale=settings.default_auto_seconds_scale,
+            phonemes_per_second=settings.default_phonemes_per_second,
+            chars_per_second=settings.default_chars_per_second,
+            padding_seconds=settings.default_duration_padding_seconds,
+            max_seconds=req.irodori.max_seconds or settings.default_max_seconds,
+        )
+        seconds = estimate.seconds
+    return seconds
+
+
+def _synthesize_text_sync(
+    runtime,
+    req: SpeechRequest,
+    text: str,
+    *,
+    use_model_duration_predictor: bool,
+):
+    sampling_req = SamplingRequest(
+        **_request_kwargs(
+            req,
+            text,
+            _chunk_seconds(
+                req,
                 text,
-                min_seconds=req.irodori.min_seconds or settings.default_auto_min_seconds,
-                scale=settings.default_auto_seconds_scale,
-                phonemes_per_second=settings.default_phonemes_per_second,
-                chars_per_second=settings.default_chars_per_second,
-                padding_seconds=settings.default_duration_padding_seconds,
-                max_seconds=req.irodori.max_seconds or settings.default_max_seconds,
-            )
-            seconds = estimate.seconds
-        sampling_req = SamplingRequest(**_request_kwargs(req, text, seconds))
-        results.append(runtime.synthesize(sampling_req, log_fn=partial(logger.info, "irodori runtime: %s")))
+                use_model_duration_predictor=use_model_duration_predictor,
+            ),
+        )
+    )
+    return runtime.synthesize(sampling_req, log_fn=partial(logger.info, "irodori runtime: %s"))
+
+
+def _synthesize_sync(runtime, req: SpeechRequest):
+    request = _request_with_seed(req)
+    use_model_duration_predictor = _runtime_uses_duration_predictor(runtime)
+    results = [
+        _synthesize_text_sync(
+            runtime,
+            request,
+            text,
+            use_model_duration_predictor=use_model_duration_predictor,
+        )
+        for text in _request_texts(request)
+    ]
     return _concat_results(results)
+
+
+def normalize_stream_format(value: str | None) -> str | None:
+    if value is None:
+        return None
+    fmt = str(value).strip().lower()
+    stream_format = STREAM_FORMAT_ALIASES.get(fmt)
+    if stream_format is None:
+        supported = ", ".join(sorted(STREAM_FORMAT_ALIASES))
+        raise ValueError(
+            f"Unsupported stream_format={value!r}. Supported formats: {supported}.",
+        )
+    return stream_format
+
+
+def _ndjson_line(payload: dict[str, Any]) -> str:
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+
+
+def _stream_error_line(message: str, *, error_type: str) -> str:
+    return _ndjson_line(
+        {
+            "type": "error",
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": None,
+                "code": None,
+            },
+        }
+    )
+
+
+async def _stream_speech_lines(
+    runtime,
+    req: SpeechRequest,
+    response_format: str,
+    started: float,
+) -> AsyncIterator[str]:
+    request = _request_with_seed(req)
+    use_model_duration_predictor = _runtime_uses_duration_predictor(runtime)
+    texts = _request_texts(request)
+    semaphore = await _get_synthesis_semaphore()
+    total_audio_seconds = 0.0
+    total_bytes = 0
+
+    async with semaphore:
+        for index, text in enumerate(texts):
+            try:
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _synthesize_text_sync,
+                        runtime,
+                        request,
+                        text,
+                        use_model_duration_predictor=use_model_duration_predictor,
+                    ),
+                    timeout=float(settings.synthesis_wait_timeout),
+                )
+            except asyncio.TimeoutError:
+                yield _stream_error_line("Synthesis timed out.", error_type="server_error")
+                return
+            except (FileNotFoundError, ValueError) as exc:
+                yield _stream_error_line(str(exc), error_type="invalid_request_error")
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("streaming speech synthesis failed")
+                yield _stream_error_line("Internal server error.", error_type="server_error")
+                return
+
+            audio_bytes = encode_audio(result.audio, result.sample_rate, response_format)
+            audio_seconds = float(result.audio.numel()) / float(result.sample_rate)
+            total_audio_seconds += audio_seconds
+            total_bytes += len(audio_bytes)
+            yield _ndjson_line(
+                {
+                    "type": "chunk",
+                    "index": index,
+                    "chunks": len(texts),
+                    "text": text,
+                    "audio": base64.b64encode(audio_bytes).decode("ascii"),
+                    "format": response_format,
+                    "mime_type": CONTENT_TYPES[response_format],
+                    "audio_seconds": audio_seconds,
+                    "sample_rate": int(result.sample_rate),
+                    "seed": getattr(result, "used_seed", request.irodori.seed),
+                }
+            )
+
+    elapsed = time.perf_counter() - started
+    logger.info(
+        "streaming speech synthesis completed: elapsed=%.2fs audio_seconds=%.2f bytes=%s seed=%s chunks=%s",
+        elapsed,
+        total_audio_seconds,
+        total_bytes,
+        request.irodori.seed,
+        len(texts),
+    )
+    yield _ndjson_line(
+        {
+            "type": "done",
+            "chunks": len(texts),
+            "elapsed_seconds": elapsed,
+            "audio_seconds": total_audio_seconds,
+            "bytes": total_bytes,
+            "seed": request.irodori.seed,
+        }
+    )
 
 
 @app.post("/v1/audio/speech")
 async def create_speech(req: SpeechRequest) -> Response:
-    if req.stream_format is not None:
-        raise HTTPException(status_code=400, detail="Streaming synthesis is not implemented.")
     requested_model = str(req.model or "").strip()
     try:
         checkpoint_file = (
@@ -432,13 +588,28 @@ async def create_speech(req: SpeechRequest) -> Response:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
+        stream_format = normalize_stream_format(req.stream_format)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
         runtime = await asyncio.to_thread(runtime_manager.get, checkpoint_file)
     except RuntimeLoadTimeoutError as exc:
         raise HTTPException(status_code=504, detail="Runtime load timed out.") from exc
 
-    request = req.model_copy(update={"input": text})
-    semaphore = await _get_synthesis_semaphore()
+    request = _request_with_seed(req.model_copy(update={"input": text}))
     started = time.perf_counter()
+    if stream_format is not None:
+        return StreamingResponse(
+            _stream_speech_lines(runtime, request, response_format, started),
+            media_type=STREAM_CONTENT_TYPES[stream_format],
+            headers={
+                "X-Irodori-Stream-Format": stream_format,
+                "X-Irodori-Chunked": "true",
+            },
+        )
+
+    semaphore = await _get_synthesis_semaphore()
     async with semaphore:
         try:
             result = await asyncio.wait_for(
