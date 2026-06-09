@@ -150,28 +150,20 @@ class DACVAECodec:
                 f"or singleton-channel (1, T)/(T, 1), got {tuple(wav.shape)}"
             )
 
-        try:
-            from audiotools import AudioSignal
-        except Exception as exc:
-            raise RuntimeError(
-                "audiotools is required when normalize_db is set. "
-                "Install audiotools or disable normalize_db."
-            ) from exc
+        del sample_rate
 
-        signal = AudioSignal(wav.unsqueeze(0).unsqueeze(0), int(sample_rate))
-        signal.normalize(float(target_db))
-        signal.ensure_max_of_audio()
-        normalized = signal.audio_data
-        if not isinstance(normalized, torch.Tensor):
-            normalized = torch.as_tensor(normalized)
-        normalized = normalized.to(dtype=torch.float32, device=wav_device)
-        normalized = normalized.squeeze()
-        if normalized.ndim != 1:
-            raise RuntimeError(
-                "audiotools normalization returned an unexpected waveform shape "
-                f"{tuple(normalized.shape)}"
-            )
-        return normalized
+        rms = torch.sqrt(torch.mean(wav.square()).clamp_min(torch.finfo(wav.dtype).eps))
+        current_db = 20.0 * torch.log10(rms)
+        gain = torch.pow(
+            torch.tensor(10.0, dtype=wav.dtype, device=wav.device),
+            (torch.as_tensor(float(target_db), dtype=wav.dtype, device=wav.device) - current_db)
+            / 20.0,
+        )
+        normalized = wav * gain
+        peak = normalized.abs().max()
+        if torch.isfinite(peak) and peak > 1.0:
+            normalized = normalized * (1.0 / peak)
+        return normalized.to(dtype=torch.float32, device=wav_device)
 
     @torch.inference_mode()
     def encode_waveform(
@@ -206,8 +198,6 @@ class DACVAECodec:
             effective_normalize_db = None
         else:
             effective_normalize_db = float(normalize_db)
-        # audiotools normalization already applies ensure_max_of_audio(), so codec-side
-        # peak scaling is only needed when normalization is disabled.
         effective_ensure_max = (
             effective_normalize_db is None and bool(ensure_max) if ensure_max is not None else False
         )
