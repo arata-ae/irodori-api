@@ -3,6 +3,15 @@ from collections.abc import Iterable
 import torch
 
 
+def _disable_transformers_sklearn_probe() -> None:
+    try:
+        from transformers.utils import import_utils
+    except ImportError:
+        return
+
+    import_utils._sklearn_available = False
+
+
 class ByteTokenizer:
     """Simple byte-level tokenizer for text-to-speech."""
 
@@ -79,6 +88,7 @@ class PretrainedTextTokenizer:
         local_files_only: bool = False,
     ) -> "PretrainedTextTokenizer":
         try:
+            _disable_transformers_sklearn_probe()
             from transformers import AutoTokenizer
         except ImportError as exc:
             raise RuntimeError(
